@@ -344,3 +344,125 @@ test('invalidate deletes the disk cache and forgets memory', async () => {
   }).get();
   assert.equal(r.catalog, null);
 });
+
+// --- 4. improvements over the Hub port ------------------------------------------
+
+test('catalogFromModels returns null when no claude-* rows remain', () => {
+  assert.equal(catalogFromModels({ data: [] }), null);
+  assert.equal(catalogFromModels({ data: [{ id: 'gpt-x' }, null, { id: 'not-a-claude-model' }] }), null);
+});
+
+test('a response with zero claude rows is invalid-response, not an empty ready catalog', async () => {
+  const r = await make({ fetch: okFetch({ data: [{ id: 'gpt-x' }] }) }).get();
+  assert.equal(r.status, 'invalid-response');
+  assert.equal(r.catalog, null);
+});
+
+test('duplicate ids are collapsed, first occurrence wins', () => {
+  const c = catalogFromModels({ data: [
+    { id: 'claude-opus-5-5', display_name: 'First' },
+    { id: 'claude-opus-4-6', display_name: 'Older' },
+    { id: 'claude-opus-5-5', display_name: 'Second' }
+  ] });
+  assert.deepEqual(c.versions.opus.map(v => v.id), ['claude-opus-5-5', 'claude-opus-4-6']);
+  assert.equal(c.versions.opus[0].displayName, 'First');
+});
+
+test('family order is fable, opus, sonnet, haiku, mythos, then others alphabetically', () => {
+  const ids = ['claude-zeta-1', 'claude-mythos-1', 'claude-haiku-4-5', 'claude-alpha-2', 'claude-sonnet-5', 'claude-opus-5', 'claude-fable-5'];
+  const c = catalogFromModels({ data: ids.map(id => ({ id })) });
+  assert.deepEqual(c.families, ['fable', 'opus', 'sonnet', 'haiku', 'mythos', 'alpha', 'zeta']);
+});
+
+test('familyOrder option overrides the built-in order (catalogFromModels and createModelCatalog)', async () => {
+  const c = catalogFromModels(MODELS, { familyOrder: ['haiku', 'sonnet'] });
+  assert.deepEqual(c.families, ['haiku', 'sonnet', 'fable', 'opus']);
+  const r = await make({ familyOrder: ['sonnet'] }).get();
+  assert.deepEqual(r.catalog.families, ['sonnet', 'fable', 'haiku', 'opus']);
+});
+
+test('log is told about every failed live fetch, with the HTTP status or exception message, never the token', async () => {
+  const lines = [];
+  const log = (level, message) => lines.push([level, String(message)]);
+  await make({ log, fetch: statusFetch(500) }).get();
+  await make({ log, fetch: async () => { throw new Error('offline'); } }).get();
+  await make({ log, fetch: statusFetch(401) }).get();
+  await make({ log, readCredential: async () => null }).get();
+  await make({ log, fetch: okFetch({ nope: true }) }).get();
+  assert.equal(lines.length, 5);
+  assert.ok(lines.every(([level]) => level === 'warn'));
+  assert.match(lines[0][1], /500/);
+  assert.match(lines[1][1], /offline/);
+  assert.match(lines[2][1], /401/);
+  assert.match(lines[3][1], /no-credential/);
+  assert.match(lines[4][1], /invalid-response/);
+  assert.ok(lines.every(([, m]) => !/\btok\b/.test(m)), 'token must never be logged');
+});
+
+test('log is silent on success, and a throwing log never breaks get()', async () => {
+  const lines = [];
+  await make({ log: (l, m) => lines.push(m) }).get();
+  assert.equal(lines.length, 0);
+  const r = await make({ log: () => { throw new Error('bad logger'); }, fetch: statusFetch(500) }).get();
+  assert.equal(r.status, 'network');
+});
+
+test('env option supplies credential env vars, ANTHROPIC_BASE_URL and the account id', async () => {
+  const f = okFetch();
+  const file = tmpCacheFile();
+  const env = { ANTHROPIC_API_KEY: 'sk-ant-api-env', ANTHROPIC_BASE_URL: 'http://models.test/' };
+  const r = await createModelCatalog({ env: () => env, fetch: f, cacheFile: file, now: () => NOW }).get();
+  assert.equal(r.status, 'ready');
+  assert.equal(f.calls[0].url, 'http://models.test/v1/models?limit=1000');
+  assert.equal(f.calls[0].opts.headers['x-api-key'], 'sk-ant-api-env');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).accountId, accountIdFromEnv(env));
+});
+
+test('env option CLAUDE_CONFIG_DIR locates the account file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-cfg-'));
+  fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'u-9' } }));
+  const file = tmpCacheFile();
+  await createModelCatalog({ env: () => ({ CLAUDE_CONFIG_DIR: dir }), readCredential: goodCred, fetch: okFetch(), cacheFile: file, now: () => NOW }).get();
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).accountId, 'uuid:u-9');
+});
+
+test('userAgent is sent only when provided', async () => {
+  const f = okFetch();
+  await make({ fetch: f, userAgent: 'gaffer/1.2' }).get();
+  assert.equal(f.calls[0].opts.headers['User-Agent'], 'gaffer/1.2');
+});
+
+test('the oauth beta header is only sent with a Bearer credential', async () => {
+  const f = okFetch();
+  await make({ fetch: f, readCredential: async () => ({ kind: 'api-key', token: 'k', expiresAt: 0 }) }).get();
+  assert.equal(f.calls[0].opts.headers['anthropic-beta'], undefined);
+});
+
+const BAD_CACHES = [
+  { catalog: { families: 'opus', versions: {} } },
+  { catalog: { families: ['opus'], versions: null } },
+  { catalog: { families: ['opus'], versions: [] } },
+  { catalog: 'nope' },
+  { catalog: { families: ['opus'], versions: {} }, fetchedAt: 'yesterday' }
+];
+
+test('an invalid persisted cache is never served as fresh', async () => {
+  for (const bad of BAD_CACHES) {
+    const file = tmpCacheFile();
+    fs.writeFileSync(file, JSON.stringify(Object.assign({ fetchedAt: NOW, accountId: 'uuid:acct-1' }, bad)));
+    const f = okFetch();
+    const r = await make({ cacheFile: file, fetch: f }).get();
+    assert.equal(f.calls.length, 1, JSON.stringify(bad));
+    assert.equal(r.fromCache, false);
+  }
+});
+
+test('an invalid persisted cache is never used as a fallback', async () => {
+  for (const bad of BAD_CACHES) {
+    const file = tmpCacheFile();
+    fs.writeFileSync(file, JSON.stringify(Object.assign({ fetchedAt: NOW - MODEL_CACHE_TTL_MS - 1, accountId: 'uuid:acct-1' }, bad)));
+    const r = await make({ cacheFile: file, fetch: statusFetch(500) }).get();
+    assert.equal(r.status, 'network', JSON.stringify(bad));
+    assert.equal(r.catalog, null);
+  }
+});
