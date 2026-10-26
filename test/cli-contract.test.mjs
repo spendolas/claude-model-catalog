@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { newTurnState, observe, classify, userMessage, LAST_VERIFIED, NEWER_PATCH_TOLERANCE, versionStatus, versionDetail, versionNotice } from '../cli-contract.cjs';
+import { newTurnState, observe, classify, classifyJsonResult, userMessage, defaultCopy, LAST_VERIFIED, NEWER_PATCH_TOLERANCE, versionStatus, versionDetail, versionNotice } from '../cli-contract.cjs';
 
 // Each fixture is a scrubbed stream-json capture from a real `claude -p` run
 // (standalone 2.1.236, the desktop app's 2.1.289 and 2.1.293), replayed
@@ -193,7 +193,7 @@ test('observe tolerates non-object and null input', () => {
   });
 });
 
-test('authentication_failed maps to auth and the copy points at Gaffer Sign in', () => {
+test('authentication_failed maps to auth and the copy points at Sign in', () => {
   var st = newTurnState(false);
   observe(st, { type: 'system', subtype: 'init', claude_code_version: '2.1.289' });
   observe(st, { type: 'assistant', error: 'authentication_failed', is_api_error_message: true,
@@ -273,15 +273,156 @@ test('versionDetail: aboveMax marks the tolerated patches so a caller can log th
   assert.deepEqual(versionDetail('nope'), { status: 'unknown', aboveMax: false, shown: null });
 });
 
-test('versionNotice: direction-aware copy, nothing for ok or tolerated or unknown, no dashes', () => {
-  assert.equal(versionNotice('2.1.289'), null);
-  assert.equal(versionNotice('2.1.310'), null, 'a tolerated patch shows nothing');
-  assert.equal(versionNotice('unknown'), null);
-  assert.equal(versionNotice(null), null);
-  var newer = versionNotice('2.2.0 (Claude Code)');
-  assert.equal(newer, 'Gaffer has not been tested with Claude Code 2.2.0 yet. If chat misbehaves, check for a Gaffer update.');
-  assert.match(versionNotice('2.1.400'), /not been tested with Claude Code 2\.1\.400 yet/, 'a far patch gets the newer copy too');
-  var older = versionNotice('2.1.200');
-  assert.equal(older, 'Gaffer was tested with Claude Code 2.1.236 to 2.1.293. You are on 2.1.200, which is older. Update Claude Code if chat misbehaves.');
+test('versionNotice: direction-aware copy naming the product, nothing for ok or tolerated or unknown, no dashes', () => {
+  var G = { product: 'Gaffer' };
+  assert.equal(versionNotice('2.1.289', G), null);
+  assert.equal(versionNotice('2.1.310', G), null, 'a tolerated patch shows nothing');
+  assert.equal(versionNotice('unknown', G), null);
+  assert.equal(versionNotice(null, G), null);
+  var newer = versionNotice('2.2.0 (Claude Code)', G);
+  assert.equal(newer, 'Gaffer has not been tested with Claude Code 2.2.0 yet. If anything misbehaves, check for an update to Gaffer.');
+  assert.match(versionNotice('2.1.400', G), /not been tested with Claude Code 2\.1\.400 yet/, 'a far patch gets the newer copy too');
+  var older = versionNotice('2.1.200', G);
+  assert.equal(older, 'Gaffer was tested with Claude Code 2.1.236 to 2.1.293. You are on 2.1.200, which is older. Update Claude Code if anything misbehaves.');
   [newer, older].forEach(function (m) { assert.equal(/[–—]/.test(m), false); });
+});
+
+// --- generalised contract (shared module) ---------------------------------------
+
+function resultOf(name) {
+  return loadEvents(name).filter(function (e) { return e.type === 'result'; })[0];
+}
+
+test('mcpServers maps every server in init to its status (generic, not Gaffer-only)', () => {
+  assert.deepEqual(newTurnState(false).mcpServers, {});
+  assert.deepEqual(replay('badmodel-293').st.mcpServers, { gaffer: 'failed' });
+  assert.deepEqual(replay('auth-293').st.mcpServers, {});
+  assert.equal('gafferMcp' in newTurnState(false), false);
+  var st = newTurnState(false);
+  observe(st, { type: 'system', subtype: 'init', mcp_servers: [{ name: 'a', status: 'connected' }, { name: 'b' }, null, { status: 'x' }] });
+  assert.deepEqual(st.mcpServers, { a: 'connected', b: null });
+});
+
+test('stderr [claude-code:unrecognized_model] on a failed turn is model via structure', () => {
+  var r = replay('badmodel-293', function (events) {
+    events.forEach(function (e) { if (e.type === 'assistant') delete e.error; });
+  });
+  assert.equal(r.verdict.kind, 'model');
+  assert.equal(r.verdict.via, 'structure');
+  // No result at all, only the tag: still a model failure.
+  assert.deepEqual(classify(newTurnState(false), 1, loadStderr('badmodel-293')), { kind: 'model', via: 'structure' });
+});
+
+test('the unrecognized_model tag never overrides a successful turn', () => {
+  var st = newTurnState(false);
+  observe(st, { type: 'result', subtype: 'success', is_error: false, result: 'Done.' });
+  assert.equal(classify(st, 0, loadStderr('badmodel-293')).kind, 'ok');
+});
+
+test('failed turn whose result says "issue with the selected model" is model via text', () => {
+  var r = replay('badmodel-293', function (events) {
+    events.forEach(function (e) { if (e.type === 'assistant') delete e.error; });
+    return '';
+  });
+  assert.equal(r.verdict.kind, 'model');
+  assert.equal(r.verdict.via, 'text');
+});
+
+test('a successful reply mentioning "issue with the selected model" stays ok', () => {
+  var st = newTurnState(false);
+  observe(st, { type: 'result', subtype: 'success', is_error: false, result: 'There was an issue with the selected model layer, fixed.' });
+  assert.equal(classify(st, 1, '').kind, 'ok');
+});
+
+test('failed turn whose result says "Not logged in" is auth via text', () => {
+  var r = replay('auth-293', function (events) {
+    events.forEach(function (e) { if (e.type === 'assistant') delete e.error; });
+  });
+  assert.equal(r.verdict.kind, 'auth');
+  assert.equal(r.verdict.via, 'text');
+});
+
+// --output-format json: one result object, no init or assistant events.
+test('classifyJsonResult: bad model with the stderr tag is model via structure', () => {
+  var v = classifyJsonResult(resultOf('badmodel-293'), { exitCode: 1, stderr: loadStderr('badmodel-293') });
+  assert.deepEqual(v, { kind: 'model', via: 'structure' });
+});
+
+test('classifyJsonResult: the 2.1.304 bad-model shape (api_error, tag on stderr) is model via structure', () => {
+  var result = { type: 'result', subtype: 'success', is_error: true, terminal_reason: 'api_error', api_error_status: 404, num_turns: 1,
+    result: "There's an issue with the selected model (claude-nope-9). It may not exist or you may not have access to it. Run --model to pick a different model." };
+  var stderr = '[claude-code:unrecognized_model] {"model":"claude-nope-9","query_source":"sdk"}\n';
+  assert.deepEqual(classifyJsonResult(result, { exitCode: 1, stderr: stderr }), { kind: 'model', via: 'structure' });
+});
+
+test('classifyJsonResult: bad model without stderr falls back to model via text', () => {
+  assert.deepEqual(classifyJsonResult(resultOf('badmodel-289'), { exitCode: 1, stderr: '' }), { kind: 'model', via: 'text' });
+});
+
+test('classifyJsonResult: failed --resume is stale_session via structure', () => {
+  ['236', '289', '293'].forEach(function (v) {
+    var verdict = classifyJsonResult(resultOf('resume-' + v), { resuming: true, exitCode: 1, stderr: loadStderr('resume-' + v) });
+    assert.deepEqual(verdict, { kind: 'stale_session', via: 'structure' }, v);
+  });
+});
+
+test('classifyJsonResult: signed out is auth (via text, the json result has no assistant error)', () => {
+  assert.deepEqual(classifyJsonResult(resultOf('auth-293'), { exitCode: 1, stderr: '' }), { kind: 'auth', via: 'text' });
+});
+
+test('classifyJsonResult: prompt too long, success, and missing result', () => {
+  assert.deepEqual(classifyJsonResult(resultOf('big-293'), { exitCode: 1 }), { kind: 'too_long', via: 'structure' });
+  assert.deepEqual(classifyJsonResult(resultOf('ok-289'), { exitCode: 0 }), { kind: 'ok', via: 'structure' });
+  assert.deepEqual(classifyJsonResult(resultOf('ok-289')), { kind: 'ok', via: 'structure' }, 'exit code defaults to 0');
+  var none = classifyJsonResult(null, { exitCode: 1, stderr: 'boom' });
+  assert.equal(none.kind, 'unknown_error');
+  assert.equal(none.text, 'boom');
+  assert.equal(classifyJsonResult('not an object', { exitCode: 2 }).kind, 'unknown_error');
+});
+
+test('versionDetail / versionStatus take lastVerified and patchTolerance', () => {
+  var opts = { lastVerified: { min: '3.0.0', max: '3.2.10' }, patchTolerance: 5 };
+  assert.equal(versionStatus('2.1.293', opts), 'older');
+  assert.equal(versionStatus('3.1.0', opts), 'ok');
+  assert.equal(versionStatus('3.2.15', opts), 'ok');
+  assert.equal(versionStatus('3.2.16', opts), 'newer');
+  assert.deepEqual(versionDetail('3.2.12', opts), { status: 'ok', aboveMax: true, shown: '3.2.12' });
+  assert.equal(versionStatus('2.1.300', { patchTolerance: 0 }), 'newer', 'a partial opts keeps the default range');
+  assert.equal(versionStatus('2.1.200', { lastVerified: { min: '2.1.100', max: '2.1.293' } }), 'ok');
+});
+
+test('versionNotice uses lastVerified and defaults the product to "This app"', () => {
+  var opts = { lastVerified: { min: '3.0.0', max: '3.2.10' } };
+  assert.equal(versionNotice('2.9.0', opts), 'This app was tested with Claude Code 3.0.0 to 3.2.10. You are on 2.9.0, which is older. Update Claude Code if anything misbehaves.');
+  assert.equal(versionNotice('4.0.0', opts), 'This app has not been tested with Claude Code 4.0.0 yet. If anything misbehaves, check for an update to this app.');
+  assert.equal(versionNotice('3.1.0', opts), null);
+});
+
+test('defaultCopy names the product and the settings place, with no dashes', () => {
+  var c = defaultCopy({ product: 'Claude', settingsPlace: 'Gaffer settings' });
+  assert.equal(c.model, 'The selected model is not available to your account. Pick another model in Gaffer settings and try again.');
+  assert.equal(c.auth, 'Claude is not signed in. Open Gaffer settings and use Sign in, then try again.');
+  var d = defaultCopy();
+  assert.equal(d.model, 'The selected model is not available to your account. Pick another model in settings and try again.');
+  Object.keys(d).forEach(function (k) {
+    assert.equal(typeof d[k], 'string', k);
+    assert.equal(/[–—]/.test(d[k]), false, k + ' has no dashes');
+  });
+  KINDS.forEach(function (k) { assert.ok(k in d, k + ' has default copy'); });
+});
+
+test('userMessage with no copy uses defaultCopy({product: Claude, settingsPlace: settings})', () => {
+  var d = defaultCopy({ product: 'Claude', settingsPlace: 'settings' });
+  assert.equal(userMessage({ kind: 'model' }), d.model);
+  assert.equal(userMessage({ kind: 'auth' }), d.auth);
+});
+
+test('userMessage copy overrides per kind and keeps the rest default', () => {
+  var copy = defaultCopy({ product: 'Claude', settingsPlace: 'Hub settings' });
+  copy.model = 'Pick a different model.';
+  assert.equal(userMessage({ kind: 'model' }, copy), 'Pick a different model.');
+  assert.equal(userMessage({ kind: 'auth' }, { model: 'x' }), defaultCopy().auth, 'a partial copy keeps defaults');
+  assert.match(userMessage({ kind: 'api_error', text: 'Overloaded' }, { api_error: 'Hub could not finish' }), /^Hub could not finish: Overloaded$/);
+  assert.equal(userMessage({ kind: 'api_error', text: '' }, { api_error: 'Hub could not finish' }), 'Hub could not finish. Please try again.');
+  assert.equal(userMessage({ kind: 'auth' }, { auth: function (v) { return 'fn:' + v.kind; } }), 'fn:auth');
 });
