@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Live Claude model discovery (GET /v1/models, per-account cache) and a pure classifier for `claude -p` turn outcomes.",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "main": "index.cjs",
   "exports": {
     ".": {
