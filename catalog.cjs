@@ -1,0 +1,296 @@
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Live model catalog
+// ---------------------------------------------------------------------------
+// The agent model picker used to be a hardcoded family/version table in
+// app.jsx that went stale with every release. The account's real model list
+// lives in Anthropic's GET /v1/models, authenticated with the Claude Code
+// OAuth token the CLI keeps in the macOS Keychain ("Claude Code-credentials",
+// open ACL — a background node read needs no prompt). Ported from Gaffer's
+// model discovery (panel/daemon/chat-handler.js).
+//
+// Rules learned the hard way there:
+// - Never cache the TOKEN. It expires (~8h) and only the CLI refreshes it,
+//   during its own API calls. Re-read it every fetch, skip the fetch when it
+//   is about to expire, and cache the CATALOG instead.
+// - Refresh opportunistically right after an agent turn — the CLI has just
+//   refreshed the token, so it is guaranteed live then.
+// - Cache per account; never serve one account's models to another.
+// - Fail closed: no live data and no cache → empty catalog + a reason, never
+//   a guessed list.
+// - No spoofed User-Agent: verified 2026-09-24 that Bearer + the oauth beta
+//   header alone returns 200.
+//
+// Side-effect free on require (server.js binds a port) and every I/O edge is
+// injectable, so it unit-tests without the network, Keychain or $HOME.
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
+
+const MODEL_CACHE_TTL_MS = 24 * 3600 * 1000;
+const EXPIRY_MARGIN_MS = 30000;
+const BACKGROUND_REFRESH_MIN_MS = 60000;
+const FETCH_TIMEOUT_MS = 12000;
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const FAMILY_ORDER = ['fable', 'opus', 'sonnet', 'haiku'];
+const ONE_M = 1000000;
+
+// Keychain / .credentials.json blob → { token, expiresAt } or null.
+function parseOauthBlob(text) {
+  if (!text) return null;
+  try {
+    const o = JSON.parse(String(text)).claudeAiOauth;
+    if (!o || !o.accessToken) return null;
+    return { token: o.accessToken, expiresAt: o.expiresAt || 0 };
+  } catch (e) {
+    return null;
+  }
+}
+
+function familyOf(id) {
+  const m = /^claude-([a-z]+)-/.exec(id || '');
+  return m ? m[1] : null;
+}
+
+// Numeric version parts without the 8-digit date stamp: claude-opus-4-5-20251101 → [4,5].
+function versionParts(id) {
+  return String(id).replace(/^claude-[a-z]+-/, '').split('-')
+    .filter(p => /^\d+$/.test(p) && p.length < 8).map(Number);
+}
+
+function versionLabel(id) {
+  return versionParts(id).join('.');
+}
+
+function compareNewestFirst(a, b) {
+  const pa = versionParts(a.id), pb = versionParts(b.id);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pb[i] || 0) - (pa[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+function effortsOf(effort) {
+  if (!effort || effort.supported !== true) return [];
+  const listed = EFFORT_LEVELS.filter(l => effort[l]);
+  if (!listed.length) return EFFORT_LEVELS.slice();
+  return listed.filter(l => effort[l].supported === true);
+}
+
+// /v1/models JSON → { families, versions: { family: [entry newest-first] } } or null.
+function catalogFromModels(json) {
+  if (!json || !Array.isArray(json.data)) return null;
+  const versions = {};
+  for (const m of json.data) {
+    const family = familyOf(m && m.id);
+    if (!family) continue;
+    (versions[family] = versions[family] || []).push({
+      id: m.id,
+      family,
+      label: versionLabel(m.id),
+      displayName: m.display_name || m.id,
+      maxInputTokens: m.max_input_tokens || null,
+      maxOutputTokens: m.max_tokens || null,
+      oneM: (m.max_input_tokens || 0) >= ONE_M,
+      efforts: effortsOf(m.capabilities && m.capabilities.effort)
+    });
+  }
+  for (const f in versions) versions[f].sort(compareNewestFirst);
+  const known = FAMILY_ORDER.filter(f => versions[f]);
+  const others = Object.keys(versions).filter(f => FAMILY_ORDER.indexOf(f) === -1).sort();
+  return { families: known.concat(others), versions };
+}
+
+// Stored CLI token (alias | pinned id | either with [1m]) → catalog entry or null.
+function resolveModel(catalog, token) {
+  if (!catalog || !token) return null;
+  const bare = String(token).replace(/\[1m\]$/, '');
+  if (catalog.versions[bare]) return catalog.versions[bare][0];
+  const family = familyOf(bare);
+  const list = family && catalog.versions[family];
+  return (list && list.find(v => v.id === bare)) || null;
+}
+
+// --- default I/O edges -------------------------------------------------------
+
+function claudeConfigDir() {
+  return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+}
+
+// Env installs, in the CLI's own precedence. They never expire.
+function readCredentialFromEnv(env) {
+  if (env.ANTHROPIC_API_KEY) return { kind: 'api-key', token: env.ANTHROPIC_API_KEY, expiresAt: 0 };
+  if (env.ANTHROPIC_AUTH_TOKEN) return { kind: 'bearer', token: env.ANTHROPIC_AUTH_TOKEN, expiresAt: 0 };
+  return null;
+}
+
+function accountIdFromEnv(env) {
+  const key = env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN;
+  return key ? 'key:' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 16) : null;
+}
+
+// Families the agent-description generator may suggest.
+function suggestableFamilies(catalog) {
+  return catalog ? catalog.families.slice() : ['opus', 'sonnet'];
+}
+
+function defaultReadCredential() {
+  const envCred = readCredentialFromEnv(process.env);
+  if (envCred) return Promise.resolve(envCred);
+  return new Promise(resolve => {
+    const fromFile = () => {
+      try {
+        resolve(parseOauthBlob(fs.readFileSync(path.join(claudeConfigDir(), '.credentials.json'), 'utf8')));
+      } catch (e) {
+        resolve(null);
+      }
+    };
+    if (process.platform !== 'darwin') return fromFile();
+    const args = ['find-generic-password'];
+    if (process.env.USER) args.push('-a', process.env.USER);
+    args.push('-s', 'Claude Code-credentials', '-w');
+    execFile('/usr/bin/security', args, { timeout: 10000 }, (err, stdout) => {
+      const cred = err ? null : parseOauthBlob(stdout);
+      if (cred) resolve(cred); else fromFile();
+    });
+  });
+}
+
+// Account identity from files only (no subprocess) so a cache hit stays fast.
+function defaultReadAccountId() {
+  const envId = accountIdFromEnv(process.env);
+  if (envId) return envId;
+  try {
+    const p = process.env.CLAUDE_CONFIG_DIR
+      ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')
+      : path.join(os.homedir(), '.claude.json');
+    const a = JSON.parse(fs.readFileSync(p, 'utf8')).oauthAccount || {};
+    if (a.accountUuid) return 'uuid:' + a.accountUuid;
+    if (a.emailAddress) return 'email:' + a.emailAddress;
+    if (a.organizationUuid) return 'org:' + a.organizationUuid;
+  } catch (e) { /* no account file */ }
+  return null;
+}
+
+// --- the cache ladder ----------------------------------------------------------
+
+function createModelCatalog(opts) {
+  const o = opts || {};
+  const readCredential = o.readCredential || defaultReadCredential;
+  const readAccountId = o.readAccountId || defaultReadAccountId;
+  const fetchImpl = o.fetch || ((u, x) => fetch(u, x));
+  const now = o.now || Date.now;
+  const cacheFile = o.cacheFile;
+  const baseUrl = String(o.baseUrl || process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
+
+  let memory = null; // { catalog, fetchedAt, accountId }
+  let lastBackground = -Infinity;
+  let inflight = null;
+
+  function readDisk() {
+    try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch (e) { return null; }
+  }
+
+  function writeDisk(entry) {
+    try {
+      fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+      fs.writeFileSync(cacheFile, JSON.stringify(entry));
+    } catch (e) { /* cache is best-effort */ }
+  }
+
+  function sameAccount(entry, accountId) {
+    return !!(entry && entry.catalog && accountId && entry.accountId === accountId);
+  }
+
+  function isFresh(entry) {
+    const age = now() - entry.fetchedAt;
+    return Number.isFinite(entry.fetchedAt) && age >= 0 && age < MODEL_CACHE_TTL_MS;
+  }
+
+  async function fetchLive() {
+    const cred = await readCredential();
+    if (!cred) return { reason: 'no-credential' };
+    if (cred.expiresAt && cred.expiresAt <= now() + EXPIRY_MARGIN_MS) return { reason: 'token-expired' };
+    let res;
+    try {
+      res = await fetchImpl(baseUrl + '/v1/models?limit=1000', {
+        headers: cred.kind === 'api-key'
+          ? { 'anthropic-version': '2023-06-01', 'x-api-key': cred.token }
+          : { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20', Authorization: 'Bearer ' + cred.token },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      });
+    } catch (e) {
+      return { reason: 'network' };
+    }
+    if (res.status === 401 || res.status === 403) return { reason: 'unauthorized' };
+    if (!res.ok) return { reason: 'network' };
+    let json = null;
+    try { json = await res.json(); } catch (e) { /* fall through */ }
+    const catalog = catalogFromModels(json);
+    return catalog ? { catalog } : { reason: 'invalid-response' };
+  }
+
+  async function get(getOpts) {
+    const force = !!(getOpts && getOpts.force);
+    const accountId = readAccountId();
+    const disk = cacheFile ? readDisk() : null;
+
+    if (!force && sameAccount(disk, accountId) && isFresh(disk)) {
+      memory = disk;
+      return { status: 'ready', catalog: disk.catalog, fetchedAt: disk.fetchedAt, fromCache: true };
+    }
+
+    const live = await fetchLive();
+    if (live.catalog) {
+      memory = { catalog: live.catalog, fetchedAt: now(), accountId };
+      if (cacheFile) writeDisk(memory);
+      return { status: 'ready', catalog: live.catalog, fetchedAt: memory.fetchedAt, fromCache: false };
+    }
+
+    const fallback = sameAccount(memory, accountId) ? memory : (sameAccount(disk, accountId) ? disk : null);
+    if (fallback) {
+      return { status: 'cached', reason: live.reason, catalog: fallback.catalog, fetchedAt: fallback.fetchedAt, fromCache: true };
+    }
+    return { status: live.reason, catalog: null, fetchedAt: null, fromCache: false };
+  }
+
+  // Fire-and-forget after an agent turn: the CLI just refreshed the token.
+  function refreshInBackground() {
+    if (inflight) return inflight;
+    if (now() - lastBackground < BACKGROUND_REFRESH_MIN_MS) return Promise.resolve();
+    lastBackground = now();
+    inflight = get({ force: true }).catch(() => {}).finally(() => { inflight = null; });
+    return inflight;
+  }
+
+  // Sign-in / sign-out: forget everything tied to the old account.
+  function invalidate() {
+    memory = null;
+    if (cacheFile) { try { fs.unlinkSync(cacheFile); } catch (e) { /* already gone */ } }
+  }
+
+  // Last known catalog, synchronously — for server-side lookups (e.g. context window).
+  function peek() {
+    return memory ? memory.catalog : null;
+  }
+
+  return { get, refreshInBackground, invalidate, peek };
+}
+
+module.exports = {
+  MODEL_CACHE_TTL_MS,
+  EFFORT_LEVELS,
+  parseOauthBlob,
+  versionLabel,
+  catalogFromModels,
+  resolveModel,
+  readCredentialFromEnv,
+  accountIdFromEnv,
+  suggestableFamilies,
+  createModelCatalog
+};

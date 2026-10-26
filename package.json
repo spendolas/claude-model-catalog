@@ -1,0 +1,20 @@
+{
+  "name": "claude-model-catalog",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Live Claude model discovery (GET /v1/models, per-account cache) and a pure classifier for `claude -p` turn outcomes.",
+  "license": "MIT",
+  "main": "index.cjs",
+  "exports": {
+    ".": {
+      "import": "./index.mjs",
+      "require": "./index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
