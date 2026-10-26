@@ -11,7 +11,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FILES = ['index.cjs', 'index.mjs', 'catalog.cjs', 'cli-contract.cjs', 'LICENSE', 'package.json'];
+const FILES = ['index.cjs', 'index.mjs', 'catalog.cjs', 'LICENSE', 'package.json'];
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 
 function run(script, args) {
@@ -77,7 +77,7 @@ test('check-vendored fails and names each changed or missing file', () => {
   const out = r.stdout + r.stderr;
   assert.match(out, /catalog\.cjs/);
   assert.match(out, /LICENSE/);
-  assert.doesNotMatch(out, /cli-contract\.cjs/);
+  assert.doesNotMatch(out, /index\.cjs/); // untouched files are not listed
 });
 
 test('check-vendored fails on a missing directory or argument', () => {

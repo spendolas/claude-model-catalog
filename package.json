@@ -1,8 +1,8 @@
 {
   "name": "claude-model-catalog",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Live Claude model discovery (GET /v1/models, per-account cache) and a pure classifier for `claude -p` turn outcomes.",
+  "description": "Live Claude model discovery: GET /v1/models with a per-account cache. Fetch-only.",
   "license": "SEE LICENSE IN LICENSE",
   "main": "index.cjs",
   "exports": {

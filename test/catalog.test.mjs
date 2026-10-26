@@ -303,7 +303,7 @@ test('refreshInBackground is throttled to once per 60s', async () => {
 
 // --- env credentials (API-key / auth-token installs, and hermetic tests) ------
 
-const { readCredentialFromEnv, accountIdFromEnv, suggestableFamilies } = require('../catalog.cjs');
+const { readCredentialFromEnv, accountIdFromEnv } = require('../catalog.cjs');
 
 test('ANTHROPIC_API_KEY wins and is sent as x-api-key; never expires', async () => {
   assert.deepEqual(readCredentialFromEnv({ ANTHROPIC_API_KEY: 'sk-ant-api-1', ANTHROPIC_AUTH_TOKEN: 'b' }),
@@ -325,11 +325,6 @@ test('env-key installs get a stable hashed account id that never contains the ke
   assert.equal(id, accountIdFromEnv({ ANTHROPIC_API_KEY: 'sk-ant-api-1' }));
   assert.notEqual(id, accountIdFromEnv({ ANTHROPIC_API_KEY: 'sk-ant-api-2' }));
   assert.equal(accountIdFromEnv({}), null);
-});
-
-test('suggestableFamilies follows the live catalog, else the old opus/sonnet pair', () => {
-  assert.deepEqual(suggestableFamilies(catalogFromModels(MODELS)), ['fable', 'opus', 'sonnet', 'haiku']);
-  assert.deepEqual(suggestableFamilies(null), ['opus', 'sonnet']);
 });
 
 test('invalidate deletes the disk cache and forgets memory', async () => {
@@ -465,4 +460,9 @@ test('an invalid persisted cache is never used as a fallback', async () => {
     assert.equal(r.status, 'network', JSON.stringify(bad));
     assert.equal(r.catalog, null);
   }
+});
+
+// Fetch-only: product policy (which families a UI may suggest) is not here.
+test('catalog exports no product policy helpers', () => {
+  assert.equal(require('../catalog.cjs').suggestableFamilies, undefined);
 });

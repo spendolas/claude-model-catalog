@@ -10,12 +10,12 @@ import * as esm from '../index.mjs';
 const require = createRequire(import.meta.url);
 const cjs = require('../index.cjs');
 const catalog = require('../catalog.cjs');
-const contract = require('../cli-contract.cjs');
 
-test('index.cjs re-exports everything from catalog.cjs and cli-contract.cjs', () => {
-  const expected = Object.keys(catalog).concat(Object.keys(contract)).sort();
+test('index.cjs re-exports exactly catalog.cjs (fetch-only: no CLI contract)', () => {
+  const expected = Object.keys(catalog).sort();
   assert.deepEqual(Object.keys(cjs).sort(), expected);
-  for (const k of expected) assert.equal(cjs[k], k in catalog ? catalog[k] : contract[k], k);
+  for (const k of expected) assert.equal(cjs[k], catalog[k], k);
+  for (const gone of ['classify', 'observe', 'newTurnState', 'versionDetail', 'userMessage']) assert.equal(cjs[gone], undefined, gone);
 });
 
 test('index.mjs exports every name in index.cjs, and nothing else', () => {

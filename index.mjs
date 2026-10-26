@@ -14,18 +14,5 @@ export const {
   resolveModel,
   readCredentialFromEnv,
   accountIdFromEnv,
-  suggestableFamilies,
-  createModelCatalog,
-  LAST_VERIFIED,
-  NEWER_PATCH_TOLERANCE,
-  UNRECOGNIZED_MODEL_TAG,
-  versionDetail,
-  versionStatus,
-  versionNotice,
-  newTurnState,
-  observe,
-  classify,
-  classifyJsonResult,
-  defaultCopy,
-  userMessage
+  createModelCatalog
 } = cjs;

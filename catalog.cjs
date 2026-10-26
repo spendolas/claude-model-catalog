@@ -151,11 +151,6 @@ function accountIdFromEnv(env) {
   return key ? 'key:' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 16) : null;
 }
 
-// Families an agent-description generator may suggest.
-function suggestableFamilies(catalog) {
-  return catalog ? catalog.families.slice() : ['opus', 'sonnet'];
-}
-
 function defaultReadCredential(env) {
   const envCred = readCredentialFromEnv(env);
   if (envCred) return Promise.resolve(envCred);
@@ -343,6 +338,5 @@ module.exports = {
   resolveModel,
   readCredentialFromEnv,
   accountIdFromEnv,
-  suggestableFamilies,
   createModelCatalog
 };

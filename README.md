@@ -1,9 +1,8 @@
 # claude-model-catalog
 
-The single source for two pieces of code that Claude Hub and Gaffer both need:
+Live Claude model discovery, and nothing else: reads the account's real model list from Anthropic's `GET /v1/models` and caches it per account, so model pickers never show a stale hardcoded list.
 
-1. **Live model discovery.** Reads the account's real model list from Anthropic's `GET /v1/models` and caches it per account, so model pickers never show a stale hardcoded list.
-2. **The `claude -p` contract.** A pure classifier for CLI turn outcomes (stream-json and json runs), plus CLI version range checks and user-facing copy.
+The `claude -p` turn classifier that used to live here (0.1.0) moved to its own repo, [claude-cli-contract](https://github.com/spendolas/claude-cli-contract); the two do not depend on each other.
 
 The source is CommonJS (`.cjs`) so Claude Hub (Node 20.14, CommonJS server) can `require` it. Gaffer (an ESM daemon on Node 20 or later) imports `index.mjs`, which re-exports the same objects. There are no runtime dependencies, only `node:` built-ins.
 
@@ -27,7 +26,6 @@ import { createModelCatalog } from 'claude-model-catalog'; // ESM
 | `versionLabel` | `(id) → string` | `claude-opus-4-5-20251101` becomes `4.5`. |
 | `readCredentialFromEnv` | `(env) → { kind, token, expiresAt } \| null` | Reads `ANTHROPIC_API_KEY` (sent as `x-api-key`), then `ANTHROPIC_AUTH_TOKEN` (Bearer). |
 | `accountIdFromEnv` | `(env) → string \| null` | A stable hashed `key:…` id for env-key installs. It never contains the key. |
-| `suggestableFamilies` | `(catalog) → string[]` | The catalog's families, or `['opus', 'sonnet']` when there is no catalog. |
 | `MODEL_CACHE_TTL_MS` | `86400000` | The cache lifetime (24h). |
 | `EFFORT_LEVELS` | `['low','medium','high','xhigh','max']` | All effort levels. |
 
@@ -59,45 +57,18 @@ Invariants:
 - The `anthropic-beta: oauth-2025-04-20` header is sent only with Bearer credentials.
 - One account's cache is never served to another account, or to an unknown one.
 
-### CLI contract (`cli-contract.cjs`)
-
-| Export | Signature | What it does |
-| --- | --- | --- |
-| `newTurnState` | `(resuming) → state` | State for one stream-json turn: `{ resuming, sawInit, sawResult, cliVersion, result, assistantError, assistantApiError, mcpServers: {name: status}, unknownTypes }`. |
-| `observe` | `(state, event)` | Feed each parsed stdout event. It never throws. |
-| `classify` | `(state, exitCode, stderr) → verdict` | Call at process close. |
-| `classifyJsonResult` | `(result, { resuming?, exitCode? = 0, stderr? }?) → verdict` | Use this for `--output-format json` runs, which print a single result object. |
-| `versionDetail` | `(version, { lastVerified?, patchTolerance? }?) → { status, aboveMax, shown }` | |
-| `versionStatus` | `(version, opts?) → 'ok' \| 'newer' \| 'older' \| 'unknown'` | |
-| `versionNotice` | `(version, { lastVerified?, patchTolerance?, product? = 'This app' }?) → string \| null` | Direction-aware copy for an out-of-range CLI. |
-| `defaultCopy` | `({ product? = 'Claude', settingsPlace? = 'settings' }?) → { [kind]: string }` | Generic per-kind copy. |
-| `userMessage` | `(verdict, copy?) → string` | `copy` overrides any subset of kinds, as a string or as `verdict => string`. |
-| `LAST_VERIFIED` | `{ min: '2.1.236', max: '2.1.293' }` | The default verified range, matching the fixtures. |
-| `NEWER_PATCH_TOLERANCE` | `30` | The default number of patch releases above `max` that still count as `ok`. |
-| `UNRECOGNIZED_MODEL_TAG` | `'[claude-code:unrecognized_model]'` | The stderr tag the CLI prints for a model it cannot resolve. |
-
-A verdict is `{ kind, via, ... }`.
-
-- `kind` is one of `ok`, `stale_session`, `too_long`, `auth`, `model`, `api_error` or `unknown_error`.
-- `via` is `structure`, `text` or `none`.
-- `api_error` adds `{ status, reason, text }`. `unknown_error` adds `{ text }`. `ok` adds `exitCode` when the process did not exit 0.
-
-Structured signals win: `terminal_reason`, `assistant.error`, the resume shape and the stderr model tag. The CLI's text is consulted only on a turn that already failed, so a successful reply can never be classified by its wording.
-
-User-facing copy contains no em or en dashes.
-
 ## Vendoring
 
 Consumers never import this repo directly. Each keeps a byte-identical copy in `vendor/claude-model-catalog`.
 
 1. Edit here, then run `npm test`, then commit.
-2. In each consumer, run its `npm run sync-models` script. That runs `node <this repo>/scripts/vendor.mjs <consumer>/vendor/claude-model-catalog`, which copies `index.cjs`, `index.mjs`, `catalog.cjs`, `cli-contract.cjs`, `LICENSE` and `package.json`, and writes `VENDORED_FROM.json` (`{ name, version, commit, dirty?, vendoredAt }`). A dirty tree is stamped `"commit": "uncommitted", "dirty": true`. The script refuses a target inside this repo.
+2. In each consumer, run its vendor sync script (Claude Hub: `npm run sync-vendor`). That runs `node <this repo>/scripts/vendor.mjs <consumer>/vendor/claude-model-catalog`, which copies `index.cjs`, `index.mjs`, `catalog.cjs`, `LICENSE` and `package.json`, and writes `VENDORED_FROM.json` (`{ name, version, commit, dirty?, vendoredAt }`). A dirty tree is stamped `"commit": "uncommitted", "dirty": true`. The script refuses a target inside this repo.
 3. Each consumer has a drift test that runs `node <this repo>/scripts/check-vendored.mjs <its vendor dir>`. It exits 0 when every file matches this repo's working copy. Otherwise it lists the changed or missing files and exits 1. The test skips when this repo is not on disk, so the consumer's CI still passes.
 
 ## Provenance
 
 - `catalog.cjs` is Claude Hub's `model-catalog.js`, which was itself a port of Gaffer's model discovery (`panel/daemon/chat-handler.js`). Changes made here: empty answers fail, ids are de-duplicated, mythos joins the family order, and the cache shape is validated. It also gained the `familyOrder`, `log`, `env` and `userAgent` options.
-- `cli-contract.cjs` is Gaffer's `panel/daemon/cli-contract.js`, generalised so nothing Gaffer-specific is built in. It has a generic `mcpServers` map, the stderr-tag and failed-turn text model detection, `classifyJsonResult`, parameterised version checks, and overridable copy. `test/fixtures/cli/` holds Gaffer's scrubbed captures, unchanged.
+- The CLI turn classifier shipped here in 0.1.0 and moved to claude-cli-contract on 2026-10-26, together with Gaffer's CLI fixtures. `suggestableFamilies` (Claude Hub product policy) moved back into Claude Hub.
 
 ## Tests
 
